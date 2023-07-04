@@ -2,8 +2,15 @@ use std::{
     any::{Any, TypeId},
     cmp::Reverse,
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::RwLock,
 };
+
+#[cfg(feature = "global-instance")]
+lazy_static::lazy_static! {
+    static ref GLOBAL_EVENT_BUS: EventBus = {
+        EventBus::default()
+    };
+}
 
 /// Describes whether the event should be propagated to other handlers further down the line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +122,11 @@ impl EventBus {
             .expect("could lock map for writing")
             .remove(&TypeId::of::<T>());
     }
+
+    #[cfg(feature = "global-instance")]
+    pub fn global() -> &'static Self {
+        &GLOBAL_EVENT_BUS
+    }
 }
 
 #[cfg(test)]
@@ -139,31 +151,33 @@ mod tests {
         }
     }
 
+    fn basic_test(eb: &EventBus) {
+        use std::thread::scope;
+
+        eb.register::<FooEvent>(Box::new(FooBarHandler), 1);
+        eb.register::<BarEvent>(Box::new(FooBarHandler), 1);
+
+        let test = || {
+            assert_eq!(eb.post("Hello"), EventPostResult::Unhandled);
+            assert_eq!(eb.post(&FooEvent), EventPostResult::Fallthrough);
+
+            assert_eq!(eb.post(&BarEvent), EventPostResult::Consumed);
+        };
+
+        scope(|s| {
+            s.spawn(test);
+            s.spawn(test);
+        });
+    }
+
     #[test]
     fn it_works() {
-        let eb = Arc::new(EventBus::default());
-
-        let eb1 = eb.clone();
-        let eb2 = eb.clone();
-
-        std::thread::spawn(move || {
-            eb1.register::<FooEvent>(Box::new(FooBarHandler), 1);
-            eb1.register::<BarEvent>(Box::new(FooBarHandler), 1);
-
-            assert_eq!(eb1.post("Hello"), EventPostResult::Unhandled);
-            assert_eq!(eb1.post(&FooEvent), EventPostResult::Fallthrough);
-
-            assert_eq!(eb1.post(&BarEvent), EventPostResult::Consumed);
-        });
-
-        std::thread::spawn(move || {
-            eb2.register::<FooEvent>(Box::new(FooBarHandler), 1);
-            eb2.register::<BarEvent>(Box::new(FooBarHandler), 1);
-
-            assert_eq!(eb2.post("Hello"), EventPostResult::Unhandled);
-            assert_eq!(eb2.post(&FooEvent), EventPostResult::Fallthrough);
-
-            assert_eq!(eb2.post(&BarEvent), EventPostResult::Consumed);
-        });
+        let eb = EventBus::default();
+        basic_test(&eb);
+        #[cfg(feature = "global-instance")]
+        {
+            let eb = EventBus::global();
+            basic_test(&eb);
+        }
     }
 }
