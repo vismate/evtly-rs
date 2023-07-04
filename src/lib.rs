@@ -1,9 +1,4 @@
-use std::{
-    any::{Any, TypeId},
-    cmp::Reverse,
-    collections::HashMap,
-    sync::RwLock,
-};
+use std::{any::Any, cmp::Reverse, ops::Deref, sync::RwLock};
 
 #[cfg(feature = "global-instance")]
 lazy_static::lazy_static! {
@@ -40,23 +35,33 @@ pub trait EventHandler<T: ?Sized>: Send + Sync {
     fn handle_event(&self, event: &T) -> EventPropagation;
 }
 
-impl<F, T> EventHandler<T> for F
+impl<T, H, DH> EventHandler<T> for DH
 where
     T: ?Sized,
-    F: Send + Sync + Fn(&T) -> EventPropagation,
+    H: EventHandler<T>,
+    DH: Deref<Target = H> + Send + Sync,
 {
     fn handle_event(&self, event: &T) -> EventPropagation {
-        (self)(event)
+        self.deref().handle_event(event)
+    }
+}
+
+/// Wrapper for an event handling closure or fn
+pub struct HandlerFn<F>(pub F);
+
+impl<T: ?Sized, F: Fn(&T) -> EventPropagation + Send + Sync> EventHandler<T> for HandlerFn<F> {
+    fn handle_event(&self, event: &T) -> EventPropagation {
+        (self.0)(event)
     }
 }
 
 /// Event bus used to register handlers and post events.
 #[derive(Debug, Default)]
 pub struct EventBus {
-    handlers: RwLock<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+    handlers: RwLock<anymap::Map<dyn Any + Send + Sync>>,
 }
 
-type Handlers<T> = Vec<(Reverse<u32>, Box<dyn EventHandler<T>>)>;
+type Handlers<T> = Vec<(Reverse<u32>, Box<dyn EventHandler<T> + Send + Sync>)>;
 
 impl EventBus {
     /// Posts an event to event handlers registered for the specified event type.
@@ -67,12 +72,8 @@ impl EventBus {
             .handlers
             .read()
             .expect("could lock map for reading")
-            .get(&TypeId::of::<T>())
+            .get::<Handlers<T>>()
         {
-            let handlers = handlers
-                .downcast_ref::<Handlers<T>>()
-                .expect("handlers for event type");
-
             for (_, handler) in handlers {
                 match handler.handle_event(event) {
                     EventPropagation::Consume => {
@@ -89,14 +90,16 @@ impl EventBus {
     }
 
     /// Registers an event handler for a specific type of event on the specified layer.
-    pub fn register<T: ?Sized + 'static>(&self, handler: Box<dyn EventHandler<T>>, layer: u32) {
+    pub fn register<T: ?Sized + 'static>(
+        &self,
+        handler: impl EventHandler<T> + 'static,
+        layer: u32,
+    ) {
         let mut map = self.handlers.write().expect("could lock map for writing");
 
         let handlers = map
-            .entry(TypeId::of::<T>())
-            .or_insert(Box::new(Handlers::<T>::default()))
-            .downcast_mut::<Handlers<T>>()
-            .expect("correctly typed handler stored");
+            .entry::<Handlers<T>>()
+            .or_insert(Handlers::<T>::default());
 
         let layer = Reverse(layer);
 
@@ -104,7 +107,7 @@ impl EventBus {
             .binary_search_by_key(&layer, |(p, _)| *p)
             .unwrap_or_else(|e| e);
 
-        handlers.insert(position, (layer, handler));
+        handlers.insert(position, (layer, Box::new(handler)));
     }
 
     /// Removes all registered event handlers.
@@ -120,7 +123,7 @@ impl EventBus {
         self.handlers
             .write()
             .expect("could lock map for writing")
-            .remove(&TypeId::of::<T>());
+            .remove::<Handlers<T>>();
     }
 
     #[cfg(feature = "global-instance")]
@@ -152,10 +155,11 @@ mod tests {
     }
 
     fn basic_test(eb: &EventBus) {
-        use std::thread::scope;
+        let handler = std::sync::Arc::new(FooBarHandler);
 
-        eb.register::<FooEvent>(Box::new(FooBarHandler), 1);
-        eb.register::<BarEvent>(Box::new(FooBarHandler), 1);
+        eb.register::<FooEvent>(handler.clone(), 1);
+        eb.register::<BarEvent>(handler, 1);
+        eb.register(HandlerFn(|evt: &i32| EventPropagation::Consume), 1);
 
         let test = || {
             assert_eq!(eb.post("Hello"), EventPostResult::Unhandled);
@@ -164,7 +168,7 @@ mod tests {
             assert_eq!(eb.post(&BarEvent), EventPostResult::Consumed);
         };
 
-        scope(|s| {
+        std::thread::scope(|s| {
             s.spawn(test);
             s.spawn(test);
         });
