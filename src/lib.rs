@@ -1,9 +1,8 @@
 use std::{
     any::{Any, TypeId},
-    cell::RefCell,
     cmp::Reverse,
     collections::HashMap,
-    rc::Rc,
+    sync::{Arc, RwLock},
 };
 
 /// Describes whether the event should be propagated to other handlers further down the line.
@@ -27,19 +26,19 @@ pub enum EventPostResult {
 }
 
 /// Handler for events of type T.
-pub trait EventHandler<T: ?Sized> {
+pub trait EventHandler<T: ?Sized>: Send + Sync {
     /// Handles the event of type T.
     ///
     /// Returns the propagation result indicating whether the event should be propagated further or consumed.
-    fn handle_event(&mut self, event: &T) -> EventPropagation;
+    fn handle_event(&self, event: &T) -> EventPropagation;
 }
 
 impl<F, T> EventHandler<T> for F
 where
     T: ?Sized,
-    F: FnMut(&T) -> EventPropagation,
+    F: Send + Sync + Fn(&T) -> EventPropagation,
 {
-    fn handle_event(&mut self, event: &T) -> EventPropagation {
+    fn handle_event(&self, event: &T) -> EventPropagation {
         (self)(event)
     }
 }
@@ -47,19 +46,24 @@ where
 /// Event bus used to register handlers and post events.
 #[derive(Debug, Default)]
 pub struct EventBus {
-    handlers: HashMap<TypeId, Box<dyn Any>>,
+    handlers: RwLock<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
 }
 
-type EventHandlers<T> = Vec<(Reverse<u32>, Box<dyn EventHandler<T>>)>;
+type Handlers<T> = Vec<(Reverse<u32>, Box<dyn EventHandler<T>>)>;
 
 impl EventBus {
     /// Posts an event to event handlers registered for the specified event type.
     ///
     /// Returns the result indicating what happened to the posted event.
-    pub fn post<T: ?Sized + 'static>(&mut self, event: &T) -> EventPostResult {
-        if let Some(handlers) = self.handlers.get_mut(&TypeId::of::<T>()) {
+    pub fn post<T: ?Sized + 'static>(&self, event: &T) -> EventPostResult {
+        if let Some(handlers) = self
+            .handlers
+            .read()
+            .expect("could lock map for reading")
+            .get(&TypeId::of::<T>())
+        {
             let handlers = handlers
-                .downcast_mut::<EventHandlers<T>>()
+                .downcast_ref::<Handlers<T>>()
                 .expect("handlers for event type");
 
             for (_, handler) in handlers {
@@ -78,12 +82,13 @@ impl EventBus {
     }
 
     /// Registers an event handler for a specific type of event on the specified layer.
-    pub fn register<T: ?Sized + 'static>(&mut self, handler: Box<dyn EventHandler<T>>, layer: u32) {
-        let handlers = self
-            .handlers
+    pub fn register<T: ?Sized + 'static>(&self, handler: Box<dyn EventHandler<T>>, layer: u32) {
+        let mut map = self.handlers.write().expect("could lock map for writing");
+
+        let handlers = map
             .entry(TypeId::of::<T>())
-            .or_insert(Box::new(EventHandlers::<T>::default()))
-            .downcast_mut::<EventHandlers<T>>()
+            .or_insert(Box::new(Handlers::<T>::default()))
+            .downcast_mut::<Handlers<T>>()
             .expect("correctly typed handler stored");
 
         let layer = Reverse(layer);
@@ -96,68 +101,69 @@ impl EventBus {
     }
 
     /// Removes all registered event handlers.
-    pub fn remove_all_handlers(&mut self) {
-        self.handlers.clear();
+    pub fn remove_all_handlers(&self) {
+        self.handlers
+            .write()
+            .expect("could lock map for writing")
+            .clear();
     }
 
     /// Removes event handlers for the specified event type.
-    pub fn remove_handlers_of<T: ?Sized + 'static>(&mut self) {
-        self.handlers.remove(&TypeId::of::<T>());
-    }
-}
-
-impl<T: ?Sized + 'static, H: EventHandler<T>> EventHandler<T> for Rc<RefCell<H>> {
-    fn handle_event(&mut self, event: &T) -> EventPropagation {
-        self.borrow_mut().handle_event(event)
+    pub fn remove_handlers_of<T: ?Sized + 'static>(&self) {
+        self.handlers
+            .write()
+            .expect("could lock map for writing")
+            .remove(&TypeId::of::<T>());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct FooEvent;
+    struct BarEvent;
 
-    struct BuildEvent((usize, usize), u32);
-    struct DestroyEvent(usize, usize);
+    struct FooBarHandler;
 
-    #[derive(Debug, Default)]
-    struct World {
-        tiles: [[Option<u32>; 3]; 3],
-    }
-
-    impl EventHandler<BuildEvent> for World {
-        fn handle_event(&mut self, event: &BuildEvent) -> EventPropagation {
-            let BuildEvent((x, y), tile) = event;
-            self.tiles[*x][*y] = Some(*tile);
+    impl EventHandler<FooEvent> for FooBarHandler {
+        fn handle_event(&self, _event: &FooEvent) -> EventPropagation {
+            println!("FooEvent handeled");
             EventPropagation::Propagate
         }
     }
 
-    impl EventHandler<DestroyEvent> for World {
-        fn handle_event(&mut self, event: &DestroyEvent) -> EventPropagation {
-            let DestroyEvent(x, y) = event;
-            self.tiles[*x][*y] = None;
+    impl EventHandler<BarEvent> for FooBarHandler {
+        fn handle_event(&self, _event: &BarEvent) -> EventPropagation {
+            println!("BarEvent handeled");
             EventPropagation::Consume
         }
     }
 
     #[test]
     fn it_works() {
-        let mut eb = EventBus::default();
+        let eb = Arc::new(EventBus::default());
 
-        let world = Rc::new(RefCell::new(World::default()));
+        let eb1 = eb.clone();
+        let eb2 = eb.clone();
 
-        eb.register::<BuildEvent>(Box::new(world.clone()), 1);
-        eb.register::<DestroyEvent>(Box::new(world.clone()), 1);
+        std::thread::spawn(move || {
+            eb1.register::<FooEvent>(Box::new(FooBarHandler), 1);
+            eb1.register::<BarEvent>(Box::new(FooBarHandler), 1);
 
-        println!("{world:?}");
+            assert_eq!(eb1.post("Hello"), EventPostResult::Unhandled);
+            assert_eq!(eb1.post(&FooEvent), EventPostResult::Fallthrough);
 
-        assert_eq!(eb.post("Hello"), EventPostResult::Unhandled);
-        assert_eq!(
-            eb.post(&BuildEvent((2, 2), 3)),
-            EventPostResult::Fallthrough
-        );
-        println!("{world:?}");
-        assert_eq!(eb.post(&DestroyEvent(2, 2)), EventPostResult::Consumed);
-        println!("{world:?}");
+            assert_eq!(eb1.post(&BarEvent), EventPostResult::Consumed);
+        });
+
+        std::thread::spawn(move || {
+            eb2.register::<FooEvent>(Box::new(FooBarHandler), 1);
+            eb2.register::<BarEvent>(Box::new(FooBarHandler), 1);
+
+            assert_eq!(eb2.post("Hello"), EventPostResult::Unhandled);
+            assert_eq!(eb2.post(&FooEvent), EventPostResult::Fallthrough);
+
+            assert_eq!(eb2.post(&BarEvent), EventPostResult::Consumed);
+        });
     }
 }
