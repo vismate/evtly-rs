@@ -18,6 +18,12 @@ pub enum EventPropagation {
     DeferConsume,
 }
 
+impl Default for EventPropagation {
+    fn default() -> Self {
+        Self::Propagate
+    }
+}
+
 type LayerIndex = u32;
 
 /// Indicates what happened to the posted event.
@@ -212,7 +218,7 @@ mod tests {
             HandlerFn(|eb: &EventBus| {
                 let res = eb.remove_all_handlers();
                 assert!(res.is_err());
-                EventPropagation::Propagate
+                EventPropagation::default()
             }),
             1,
         );
