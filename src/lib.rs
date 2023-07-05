@@ -14,17 +14,23 @@ pub enum EventPropagation {
     Propagate,
     /// Stop propagation of this event.
     Consume,
+    /// Let other handlers on this layer handle this event, but don't let it propagate to further layers.
+    DeferConsume,
 }
+
+type LayerIndex = u32;
 
 /// Indicates what happened to the posted event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventPostResult {
     /// There were no event handlers registered for this event, so it was not handled.
     Unhandled,
-    /// The event was handled by all registered event handlers for this type of event.
-    Fallthrough,
-    /// Some event handler consumed the event, stopping its propagation.
-    Consumed,
+    /// The event was handled by all registered event handlers for this type of event and was never consumed in any way.
+    FellThrough,
+    /// Some event handler consumed the event, stopping its propagation immidiately.
+    ConsumedImmidiately(LayerIndex),
+    /// Some event handler consumed the event, but let it propagate to other handlers on the same layer.
+    ConsumedOnLayer(LayerIndex),
 }
 
 /// Handler for events of type T.
@@ -74,16 +80,28 @@ impl EventBus {
             .expect("could lock map for reading")
             .get::<Handlers<T>>()
         {
-            for (_, handler) in handlers {
+            let mut consume_on_layer = None;
+
+            for (Reverse(layer), handler) in handlers {
+                if consume_on_layer.is_some_and(|consume_on| consume_on != *layer) {
+                    return EventPostResult::ConsumedOnLayer(consume_on_layer.unwrap());
+                }
+
                 match handler.handle_event(event) {
                     EventPropagation::Consume => {
-                        return EventPostResult::Consumed;
+                        return EventPostResult::ConsumedImmidiately(*layer);
+                    }
+                    EventPropagation::DeferConsume => {
+                        consume_on_layer = Some(*layer);
                     }
                     EventPropagation::Propagate => continue,
                 }
             }
 
-            EventPostResult::Fallthrough
+            // Technically the event was seen by all handlers, but we do this to be consistent with the ConsumeImmidiately case.
+            consume_on_layer.map_or(EventPostResult::FellThrough, |consume_on| {
+                EventPostResult::ConsumedOnLayer(consume_on)
+            })
         } else {
             EventPostResult::Unhandled
         }
@@ -111,19 +129,19 @@ impl EventBus {
     }
 
     /// Removes all registered event handlers.
-    pub fn remove_all_handlers(&self) {
-        self.handlers
-            .write()
-            .expect("could lock map for writing")
-            .clear();
+    /// Returns an error if could not lock the handlers at the moment
+    pub fn remove_all_handlers(&self) -> Result<(), Box<dyn std::error::Error + '_>> {
+        self.handlers.try_write()?.clear();
+        Ok(())
     }
 
     /// Removes event handlers for the specified event type.
-    pub fn remove_handlers_of<T: ?Sized + 'static>(&self) {
-        self.handlers
-            .write()
-            .expect("could lock map for writing")
-            .remove::<Handlers<T>>();
+    /// Returns an error if could not lock the handlers at the moment
+    pub fn remove_handlers_of<T: ?Sized + 'static>(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + '_>> {
+        self.handlers.try_write()?.remove::<Handlers<T>>();
+        Ok(())
     }
 
     #[cfg(feature = "global-instance")]
@@ -159,13 +177,13 @@ mod tests {
 
         eb.register::<FooEvent>(handler.clone(), 1);
         eb.register::<BarEvent>(handler, 1);
-        eb.register(HandlerFn(|evt: &i32| EventPropagation::Consume), 1);
+        eb.register(HandlerFn(|_evt: &i32| EventPropagation::Consume), 1);
 
         let test = || {
             assert_eq!(eb.post("Hello"), EventPostResult::Unhandled);
-            assert_eq!(eb.post(&FooEvent), EventPostResult::Fallthrough);
+            assert_eq!(eb.post(&FooEvent), EventPostResult::FellThrough);
 
-            assert_eq!(eb.post(&BarEvent), EventPostResult::Consumed);
+            assert_eq!(eb.post(&BarEvent), EventPostResult::ConsumedImmidiately(1));
         };
 
         std::thread::scope(|s| {
