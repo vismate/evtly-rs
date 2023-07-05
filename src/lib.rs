@@ -67,7 +67,7 @@ pub struct EventBus {
     handlers: RwLock<anymap::Map<dyn Any + Send + Sync>>,
 }
 
-type Handlers<T> = Vec<(Reverse<u32>, Box<dyn EventHandler<T> + Send + Sync>)>;
+type Handlers<T> = Vec<(Reverse<u32>, Box<dyn EventHandler<T>>)>;
 
 impl EventBus {
     /// Posts an event to event handlers registered for the specified event type.
@@ -111,7 +111,7 @@ impl EventBus {
     pub fn register<T: ?Sized + 'static>(
         &self,
         handler: impl EventHandler<T> + 'static,
-        layer: u32,
+        layer: LayerIndex,
     ) {
         let mut map = self.handlers.write().expect("could lock map for writing");
 
