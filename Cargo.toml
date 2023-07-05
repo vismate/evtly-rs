@@ -7,6 +7,8 @@ edition = "2021"
 
 [dependencies]
 anymap = "~1.0.0-beta.2"
+parking_lot = "~0.12"
+uuid = { version = "~1.4", features = ["v4", "fast-rng"] }
 lazy_static = { version = "~1.4", optional = true }
 
 [features]

@@ -1,4 +1,5 @@
-use std::{any::Any, cmp::Reverse, ops::Deref, sync::RwLock};
+use std::{any::Any, ops::Deref};
+use uuid::Uuid;
 
 #[cfg(feature = "global-instance")]
 lazy_static::lazy_static! {
@@ -47,6 +48,7 @@ pub trait EventHandler<T: ?Sized>: Send + Sync {
     fn handle_event(&self, event: &T) -> EventPropagation;
 }
 
+// This implementation makes using smart pointers (eg.: Arc) as handlers much easier
 impl<T, H, DH> EventHandler<T> for DH
 where
     T: ?Sized,
@@ -70,46 +72,54 @@ impl<T: ?Sized, F: Fn(&T) -> EventPropagation + Send + Sync> EventHandler<T> for
 /// Event bus used to register handlers and post events.
 #[derive(Debug, Default)]
 pub struct EventBus {
-    handlers: RwLock<anymap::Map<dyn Any + Send + Sync>>,
+    handlers: parking_lot::RwLock<anymap::Map<dyn Any + Send + Sync>>,
 }
 
-type Handlers<T> = Vec<(Reverse<u32>, Box<dyn EventHandler<T>>)>;
+struct HandlerWithMeta<T: ?Sized> {
+    layer: LayerIndex,
+    uuid: Uuid,
+    handler: Box<dyn EventHandler<T>>,
+}
+
+type Handlers<T> = Vec<HandlerWithMeta<T>>;
+
+pub struct TypedUuid<T: ?Sized>(Uuid, std::marker::PhantomData<T>);
 
 impl EventBus {
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10);
+    const TIMEOUT_ERROR: &'static str = "EventBus timeout error";
+
     /// Posts an event to event handlers registered for the specified event type.
     ///
     /// Returns the result indicating what happened to the posted event.
     pub fn post<T: ?Sized + 'static>(&self, event: &T) -> EventPostResult {
-        if let Some(handlers) = self
-            .handlers
-            .read()
-            .expect("could lock map for reading")
-            .get::<Handlers<T>>()
-        {
-            let mut consume_on_layer = None;
+        match self.handlers.read().get::<Handlers<T>>() {
+            Some(handlers) if !handlers.is_empty() => {
+                let mut consume_on_layer = None;
 
-            for (Reverse(layer), handler) in handlers {
-                if consume_on_layer.is_some_and(|consume_on| consume_on != *layer) {
-                    return EventPostResult::ConsumedOnLayer(consume_on_layer.unwrap());
+                for h in handlers {
+                    if consume_on_layer.is_some_and(|consume_on| consume_on != h.layer) {
+                        return EventPostResult::ConsumedOnLayer(consume_on_layer.unwrap());
+                    }
+
+                    match h.handler.handle_event(event) {
+                        EventPropagation::Consume => {
+                            return EventPostResult::ConsumedImmidiately(h.layer);
+                        }
+                        EventPropagation::DeferConsume => {
+                            consume_on_layer = Some(h.layer);
+                        }
+                        EventPropagation::Propagate => continue,
+                    }
                 }
 
-                match handler.handle_event(event) {
-                    EventPropagation::Consume => {
-                        return EventPostResult::ConsumedImmidiately(*layer);
-                    }
-                    EventPropagation::DeferConsume => {
-                        consume_on_layer = Some(*layer);
-                    }
-                    EventPropagation::Propagate => continue,
-                }
+                // Technically the event was seen by all handlers, but we do this to be consistent with the ConsumeImmidiately case.
+                consume_on_layer.map_or(EventPostResult::FellThrough, |consume_on| {
+                    EventPostResult::ConsumedOnLayer(consume_on)
+                })
             }
 
-            // Technically the event was seen by all handlers, but we do this to be consistent with the ConsumeImmidiately case.
-            consume_on_layer.map_or(EventPostResult::FellThrough, |consume_on| {
-                EventPostResult::ConsumedOnLayer(consume_on)
-            })
-        } else {
-            EventPostResult::Unhandled
+            _ => EventPostResult::Unhandled,
         }
     }
 
@@ -118,26 +128,41 @@ impl EventBus {
         &self,
         handler: impl EventHandler<T> + 'static,
         layer: LayerIndex,
-    ) {
-        let mut map = self.handlers.write().expect("could lock map for writing");
+    ) -> Result<TypedUuid<T>, Box<dyn std::error::Error + '_>> {
+        let mut map = self
+            .handlers
+            .try_write_for(Self::TIMEOUT)
+            .ok_or(Self::TIMEOUT_ERROR)?;
 
         let handlers = map
             .entry::<Handlers<T>>()
             .or_insert(Handlers::<T>::default());
 
-        let layer = Reverse(layer);
-
         let position = handlers
-            .binary_search_by_key(&layer, |(p, _)| *p)
+            .binary_search_by_key(&layer, |h| h.layer)
             .unwrap_or_else(|e| e);
 
-        handlers.insert(position, (layer, Box::new(handler)));
+        let uuid = Uuid::new_v4();
+
+        handlers.insert(
+            position,
+            HandlerWithMeta {
+                layer,
+                uuid,
+                handler: Box::new(handler),
+            },
+        );
+
+        Ok(TypedUuid(uuid, std::marker::PhantomData))
     }
 
     /// Removes all registered event handlers.
     /// Returns an error if could not lock the handlers at the moment
     pub fn remove_all_handlers(&self) -> Result<(), Box<dyn std::error::Error + '_>> {
-        self.handlers.try_write()?.clear();
+        self.handlers
+            .try_write_for(Self::TIMEOUT)
+            .ok_or(Self::TIMEOUT_ERROR)?
+            .clear();
         Ok(())
     }
 
@@ -146,8 +171,38 @@ impl EventBus {
     pub fn remove_handlers_of<T: ?Sized + 'static>(
         &self,
     ) -> Result<(), Box<dyn std::error::Error + '_>> {
-        self.handlers.try_write()?.remove::<Handlers<T>>();
+        self.handlers
+            .try_write_for(Self::TIMEOUT)
+            .ok_or(Self::TIMEOUT_ERROR)?
+            .remove::<Handlers<T>>();
         Ok(())
+    }
+
+    /// Remove a specific handler identified by the uuid return by the register method
+    pub fn remove_handler<T: ?Sized + 'static>(
+        &self,
+        uuid: TypedUuid<T>,
+    ) -> Result<(), Box<dyn std::error::Error + '_>> {
+        if let Some(handlers) = self
+            .handlers
+            .try_write_for(Self::TIMEOUT)
+            .ok_or(Self::TIMEOUT_ERROR)?
+            .get_mut::<Handlers<T>>()
+        {
+            handlers.retain(|h| uuid.0 != h.uuid);
+        }
+
+        Ok(())
+    }
+
+    /// Index of the very first layer possible
+    pub const fn foreground_layer() -> LayerIndex {
+        LayerIndex::MIN
+    }
+
+    /// Index of the very last layer possible
+    pub const fn background_layer() -> LayerIndex {
+        LayerIndex::MAX
     }
 
     #[cfg(feature = "global-instance")]
@@ -183,10 +238,13 @@ mod tests {
 
         eb.register::<FooEvent>(handler.clone(), 1);
         eb.register::<BarEvent>(handler, 1);
-        eb.register(HandlerFn(|_evt: &i32| EventPropagation::Consume), 1);
+        let to_remove = eb.register(HandlerFn(|_evt: &i32| EventPropagation::Consume), 1);
+
+        assert!(eb.remove_handler(to_remove.unwrap()).is_ok());
 
         let test = || {
             assert_eq!(eb.post("Hello"), EventPostResult::Unhandled);
+            assert_eq!(eb.post(&42i32), EventPostResult::Unhandled);
             assert_eq!(eb.post(&FooEvent), EventPostResult::FellThrough);
 
             assert_eq!(eb.post(&BarEvent), EventPostResult::ConsumedImmidiately(1));
