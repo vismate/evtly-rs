@@ -202,4 +202,21 @@ mod tests {
             basic_test(&eb);
         }
     }
+
+    #[test]
+    fn try_mut_eb_in_handler() {
+        let eb = EventBus::default();
+
+        // We post the eventbus itself to avoid using the global feature
+        eb.register(
+            HandlerFn(|eb: &EventBus| {
+                let res = eb.remove_all_handlers();
+                assert!(res.is_err());
+                EventPropagation::Propagate
+            }),
+            1,
+        );
+
+        eb.post(&eb);
+    }
 }
