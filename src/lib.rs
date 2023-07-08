@@ -65,7 +65,7 @@ type Handlers<T> = Vec<HandlerWithMeta<T>>;
 
 #[derive(Debug)]
 pub struct TimeoutError {
-    timeout: Duration,
+    pub timeout: Duration,
 }
 
 impl std::fmt::Display for TimeoutError {
