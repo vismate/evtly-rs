@@ -1,5 +1,4 @@
-use std::{any::Any, ops::Deref};
-use uuid::Uuid;
+use std::{any::Any, ops::Deref, sync::Arc, time::Duration};
 
 #[cfg(feature = "global-instance")]
 lazy_static::lazy_static! {
@@ -63,6 +62,12 @@ where
 /// Wrapper for an event handling closure or fn
 pub struct HandlerFn<F>(pub F);
 
+impl<F> HandlerFn<F> {
+    pub fn new(f: F) -> Arc<Self> {
+        Arc::new(HandlerFn(f))
+    }
+}
+
 impl<T: ?Sized, F> EventHandler<T> for HandlerFn<F>
 where
     for<'a> F: Fn(&'a T) -> EventPropagation + Send + Sync,
@@ -72,31 +77,38 @@ where
     }
 }
 
+struct HandlerWithMeta<T: ?Sized> {
+    layer: LayerIndex,
+    handler: Arc<dyn EventHandler<T>>,
+}
+
+type Handlers<T> = Vec<HandlerWithMeta<T>>;
+
+#[derive(Debug)]
+pub struct TimeoutError {
+    timeout: Duration,
+}
+
+impl std::fmt::Display for TimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "EventBus error: timeout = {}ms",
+            self.timeout.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for TimeoutError {}
+
 /// Event bus used to register handlers and post events.
 #[derive(Debug, Default)]
 pub struct EventBus {
     handlers: parking_lot::RwLock<anymap::Map<dyn Any + Send + Sync>>,
 }
 
-struct HandlerWithMeta<T: ?Sized> {
-    layer: LayerIndex,
-    uuid: Uuid,
-    handler: Box<dyn EventHandler<T>>,
-}
-
-type Handlers<T> = Vec<HandlerWithMeta<T>>;
-
-pub struct TypedUuid<T: ?Sized>(Uuid, std::marker::PhantomData<T>);
-
-impl<T: ?Sized> From<Uuid> for TypedUuid<T> {
-    fn from(value: Uuid) -> Self {
-        TypedUuid(value, std::marker::PhantomData)
-    }
-}
-
 impl EventBus {
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10);
-    const TIMEOUT_ERROR: &'static str = "EventBus timeout error";
+    const DEFAULT_TIMEOUT: Duration = Duration::from_millis(10);
 
     /// Posts an event to event handlers registered for the specified event type.
     ///
@@ -133,15 +145,16 @@ impl EventBus {
     }
 
     /// Registers an event handler for a specific type of event on the specified layer.
-    pub fn register<T: ?Sized + 'static>(
+    pub fn register_with_timeout<T: ?Sized + 'static>(
         &self,
-        handler: impl EventHandler<T> + 'static,
+        handler: Arc<impl EventHandler<T> + 'static>,
         layer: LayerIndex,
-    ) -> Result<TypedUuid<T>, Box<dyn std::error::Error + '_>> {
+        timeout: Duration,
+    ) -> Result<(), TimeoutError> {
         let mut map = self
             .handlers
-            .try_write_for(Self::TIMEOUT)
-            .ok_or(Self::TIMEOUT_ERROR)?;
+            .try_write_for(timeout)
+            .ok_or(TimeoutError { timeout })?;
 
         let handlers = map
             .entry::<Handlers<T>>()
@@ -151,57 +164,82 @@ impl EventBus {
             .binary_search_by_key(&layer, |h| h.layer)
             .unwrap_or_else(|e| e);
 
-        let uuid = Uuid::new_v4();
+        handlers.insert(position, HandlerWithMeta { layer, handler });
 
-        handlers.insert(
-            position,
-            HandlerWithMeta {
-                layer,
-                uuid,
-                handler: Box::new(handler),
-            },
-        );
+        Ok(())
+    }
 
-        Ok(uuid.into())
+    #[inline]
+    pub fn register<T: ?Sized + 'static>(
+        &self,
+        handler: Arc<impl EventHandler<T> + 'static>,
+        layer: LayerIndex,
+    ) -> Result<(), TimeoutError> {
+        self.register_with_timeout(handler, layer, Self::DEFAULT_TIMEOUT)
     }
 
     /// Removes all registered event handlers.
     /// Returns an error if could not lock the handlers at the moment
-    pub fn remove_all_handlers(&self) -> Result<(), Box<dyn std::error::Error + '_>> {
+    pub fn remove_all_handlers_with_timeout(&self, timeout: Duration) -> Result<(), TimeoutError> {
         self.handlers
-            .try_write_for(Self::TIMEOUT)
-            .ok_or(Self::TIMEOUT_ERROR)?
+            .try_write_for(timeout)
+            .ok_or(TimeoutError { timeout })?
             .clear();
         Ok(())
     }
 
+    #[inline]
+    pub fn remove_all_handlers(&self) -> Result<(), TimeoutError> {
+        self.remove_all_handlers_with_timeout(Self::DEFAULT_TIMEOUT)
+    }
+
     /// Removes event handlers for the specified event type.
     /// Returns an error if could not lock the handlers at the moment
-    pub fn remove_handlers_of<T: ?Sized + 'static>(
+    pub fn remove_handlers_of_with_timeout<T: ?Sized + 'static>(
         &self,
-    ) -> Result<(), Box<dyn std::error::Error + '_>> {
+        timeout: Duration,
+    ) -> Result<(), TimeoutError> {
         self.handlers
-            .try_write_for(Self::TIMEOUT)
-            .ok_or(Self::TIMEOUT_ERROR)?
+            .try_write_for(timeout)
+            .ok_or(TimeoutError { timeout })?
             .remove::<Handlers<T>>();
         Ok(())
     }
 
+    #[inline]
+    pub fn remove_handlers_of<T: ?Sized + 'static>(&self) -> Result<(), TimeoutError> {
+        self.remove_handlers_of_with_timeout::<T>(Self::DEFAULT_TIMEOUT)
+    }
+
     /// Remove a specific handler identified by the uuid return by the register method
-    pub fn remove_handler<T: ?Sized + 'static>(
+    pub fn remove_handler_with_timeout<T: ?Sized + 'static>(
         &self,
-        uuid: TypedUuid<T>,
-    ) -> Result<(), Box<dyn std::error::Error + '_>> {
+        handler: &Arc<impl EventHandler<T> + 'static>,
+        timeout: Duration,
+    ) -> Result<(), TimeoutError> {
+        // TODO: Mayber there is a nicer way? Arc::ptr_eq requires same Ts for both handlers.
+        // One is impl EvenHandler<T> the others is dyn EventHandler<T>
+        let handler_ptr = Arc::as_ptr(handler) as *const ();
         if let Some(handlers) = self
             .handlers
-            .try_write_for(Self::TIMEOUT)
-            .ok_or(Self::TIMEOUT_ERROR)?
+            .try_write_for(timeout)
+            .ok_or(TimeoutError { timeout })?
             .get_mut::<Handlers<T>>()
         {
-            handlers.retain(|h| uuid.0 != h.uuid);
+            handlers.retain(|other| {
+                !std::ptr::eq(handler_ptr, Arc::as_ptr(&other.handler) as *const ())
+            });
         }
 
         Ok(())
+    }
+
+    #[inline]
+    pub fn remove_handler<T: ?Sized + 'static>(
+        &self,
+        handler: &Arc<impl EventHandler<T> + 'static>,
+    ) -> Result<(), TimeoutError> {
+        self.remove_handler_with_timeout(handler, Self::DEFAULT_TIMEOUT)
     }
 
     /// Index of the very first layer possible
@@ -243,13 +281,14 @@ mod tests {
     }
 
     fn basic_test(eb: &EventBus) {
-        let handler = std::sync::Arc::new(FooBarHandler);
+        let handler = Arc::new(FooBarHandler);
 
-        eb.register::<FooEvent>(handler.clone(), 1);
-        eb.register::<BarEvent>(handler, 1);
-        let to_remove = eb.register(HandlerFn(|_evt: &i32| EventPropagation::Consume), 1);
+        let _ = eb.register::<FooEvent>(handler.clone(), 1);
+        let _ = eb.register::<BarEvent>(handler, 1);
+        let to_remove = HandlerFn::new(|_evt: &i32| EventPropagation::Consume);
+        let _ = eb.register(to_remove.clone(), 1);
 
-        assert!(eb.remove_handler(to_remove.unwrap()).is_ok());
+        assert!(eb.remove_handler(&to_remove).is_ok());
 
         let test = || {
             assert_eq!(eb.post("Hello"), EventPostResult::Unhandled);
@@ -281,8 +320,8 @@ mod tests {
         let eb = EventBus::default();
 
         // We post the eventbus itself to avoid using the global feature
-        eb.register(
-            HandlerFn(|eb: &EventBus| {
+        let _ = eb.register(
+            HandlerFn::new(|eb: &EventBus| {
                 let res = eb.remove_all_handlers();
                 assert!(res.is_err());
                 EventPropagation::default()
@@ -296,8 +335,8 @@ mod tests {
     #[test]
     fn dyn_traits() {
         let eb = EventBus::default();
-        eb.register::<dyn std::fmt::Debug>(
-            HandlerFn(|evt: &(dyn std::fmt::Debug + '_)| {
+        let _ = eb.register::<dyn std::fmt::Debug>(
+            HandlerFn::new(|evt: &(dyn std::fmt::Debug + '_)| {
                 println!("{evt:?}");
                 EventPropagation::Propagate
             }),
