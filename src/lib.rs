@@ -63,7 +63,10 @@ where
 /// Wrapper for an event handling closure or fn
 pub struct HandlerFn<F>(pub F);
 
-impl<T: ?Sized, F: Fn(&T) -> EventPropagation + Send + Sync> EventHandler<T> for HandlerFn<F> {
+impl<T: ?Sized, F> EventHandler<T> for HandlerFn<F>
+where
+    for<'a> F: Fn(&'a T) -> EventPropagation + Send + Sync,
+{
     fn handle_event(&self, event: &T) -> EventPropagation {
         (self.0)(event)
     }
@@ -84,6 +87,12 @@ struct HandlerWithMeta<T: ?Sized> {
 type Handlers<T> = Vec<HandlerWithMeta<T>>;
 
 pub struct TypedUuid<T: ?Sized>(Uuid, std::marker::PhantomData<T>);
+
+impl<T: ?Sized> From<Uuid> for TypedUuid<T> {
+    fn from(value: Uuid) -> Self {
+        TypedUuid(value, std::marker::PhantomData)
+    }
+}
 
 impl EventBus {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10);
@@ -153,7 +162,7 @@ impl EventBus {
             },
         );
 
-        Ok(TypedUuid(uuid, std::marker::PhantomData))
+        Ok(uuid.into())
     }
 
     /// Removes all registered event handlers.
@@ -282,5 +291,21 @@ mod tests {
         );
 
         eb.post(&eb);
+    }
+
+    #[test]
+    fn dyn_traits() {
+        let eb = EventBus::default();
+        eb.register::<dyn std::fmt::Debug>(
+            HandlerFn(|evt: &(dyn std::fmt::Debug + '_)| {
+                println!("{evt:?}");
+                EventPropagation::Propagate
+            }),
+            EventBus::foreground_layer(),
+        );
+
+        let eb_ref = &eb;
+
+        eb.post(eb_ref as &dyn std::fmt::Debug);
     }
 }
