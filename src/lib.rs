@@ -1,4 +1,4 @@
-use std::{any::Any, ops::Deref, sync::Arc, time::Duration};
+use std::{any::Any, sync::Arc, time::Duration};
 
 #[cfg(feature = "global-instance")]
 lazy_static::lazy_static! {
@@ -47,33 +47,12 @@ pub trait EventHandler<T: ?Sized>: Send + Sync {
     fn handle_event(&self, event: &T) -> EventPropagation;
 }
 
-// This implementation makes using smart pointers (eg.: Arc) as handlers much easier
-impl<T, H, DH> EventHandler<T> for DH
-where
-    T: ?Sized,
-    H: EventHandler<T>,
-    DH: Deref<Target = H> + Send + Sync,
-{
-    fn handle_event(&self, event: &T) -> EventPropagation {
-        self.deref().handle_event(event)
-    }
-}
-
-/// Wrapper for an event handling closure or fn
-pub struct HandlerFn<F>(pub F);
-
-impl<F> HandlerFn<F> {
-    pub fn new(f: F) -> Arc<Self> {
-        Arc::new(HandlerFn(f))
-    }
-}
-
-impl<T: ?Sized, F> EventHandler<T> for HandlerFn<F>
+impl<T: ?Sized, F> EventHandler<T> for F
 where
     for<'a> F: Fn(&'a T) -> EventPropagation + Send + Sync,
 {
     fn handle_event(&self, event: &T) -> EventPropagation {
-        (self.0)(event)
+        (self)(event)
     }
 }
 
@@ -285,7 +264,7 @@ mod tests {
 
         let _ = eb.register::<FooEvent>(handler.clone(), 1);
         let _ = eb.register::<BarEvent>(handler, 1);
-        let to_remove = HandlerFn::new(|_evt: &i32| EventPropagation::Consume);
+        let to_remove = Arc::new(|_evt: &i32| EventPropagation::Consume);
         let _ = eb.register(to_remove.clone(), 1);
 
         assert!(eb.remove_handler(&to_remove).is_ok());
@@ -321,7 +300,7 @@ mod tests {
 
         // We post the eventbus itself to avoid using the global feature
         let _ = eb.register(
-            HandlerFn::new(|eb: &EventBus| {
+            Arc::new(|eb: &EventBus| {
                 let res = eb.remove_all_handlers();
                 assert!(res.is_err());
                 EventPropagation::default()
@@ -336,7 +315,7 @@ mod tests {
     fn dyn_traits() {
         let eb = EventBus::default();
         let _ = eb.register::<dyn std::fmt::Debug>(
-            HandlerFn::new(|evt: &(dyn std::fmt::Debug + '_)| {
+            Arc::new(|evt: &(dyn std::fmt::Debug + '_)| {
                 println!("{evt:?}");
                 EventPropagation::Propagate
             }),
